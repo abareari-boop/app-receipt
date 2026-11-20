@@ -93,7 +93,7 @@ with tab1:
                         }
                         """
                         response = client.models.generate_content(
-                            model="gemini-2.5-flash",
+                            model="gemini-3.8-flash",
                             contents=[image, prompt],
                             config=types.GenerateContentConfig(
                                 response_mime_type="application/json"
@@ -229,7 +229,7 @@ with tab2:
                         client = genai.Client(api_key=GEMINI_API_KEY)
                         c_prompt = f"ユーザー（ありんこ）の今日の振り返り日記です。気分：{d_mood}\n内容：{d_content}\nこれに対して、親しみやすいフランクな口調で、労いやポジティブな一言コメントを2〜3文（100文字以内）で返してください。"
                         c_res = client.models.generate_content(
-                            model="gemini-2.5-flash",
+                            model="gemini-3.8-flash",
                             contents=c_prompt,
                         )
                         ai_reply = c_res.text.strip()
