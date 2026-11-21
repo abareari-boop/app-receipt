@@ -3,6 +3,7 @@ import json
 import os
 from google import genai
 from google.genai import types
+import pandas as pd
 from PIL import Image
 import requests
 import streamlit as st
@@ -13,12 +14,10 @@ st.set_page_config(
     layout="centered",
 )
 
-# 日本時間の今日の日付を取得
 JST = timezone(timedelta(hours=9))
 today_jst = datetime.now(JST).date()
 
 
-# --- 秘密の鍵（Secrets）の読み込み ---
 def get_secret(key, default=""):
     try:
         if key in st.secrets:
@@ -30,23 +29,82 @@ def get_secret(key, default=""):
 
 GEMINI_API_KEY = get_secret("gemini_api_key")
 GAS_WEBAPP_URL = get_secret("gas_webapp_url")
+APP_PASSWORD = get_secret("app_password")  # Secretsに設定すれば合言葉ロック有効！
 
-st.title("🧾 レシート家計簿 ＆ 1日の振り返り")
+# ==========================================================
+# 🔒 合言葉（パスワード）ロック機能
+# ==========================================================
+if APP_PASSWORD:
+    if not st.session_state.get("authenticated", False):
+        st.title("🔒 ありんこ専用ロック")
+        st.caption("合言葉を入力してロックを解除してね！")
+        pw_input = st.text_input("合言葉（パスワード）", type="password")
+        if st.button("🔓 ロック解除", type="primary", use_container_width=True):
+            if pw_input == APP_PASSWORD:
+                st.session_state["authenticated"] = True
+                st.rerun()
+            else:
+                st.error("合言葉が違うよ！")
+        st.stop()
 
-# サイドバーで手動入力もできるようにしておく（ローカルテスト用）
+st.title("🧾 レシート家計簿 ＆ 振り返り")
+
 with st.sidebar:
-    st.header("🔑 接続設定")
-    if not GEMINI_API_KEY:
-        GEMINI_API_KEY = st.text_input("Gemini API キー", type="password")
-    else:
+    st.header("⚙️ 設定・目標予算")
+    monthly_budget = st.number_input(
+        "💰 今月の目標予算（円）",
+        min_value=10000,
+        max_value=1000000,
+        value=100000,
+        step=5000,
+    )
+    st.divider()
+    if GEMINI_API_KEY:
         st.success("✅ Gemini API 接続OK")
-
-    if not GAS_WEBAPP_URL:
-        GAS_WEBAPP_URL = st.text_input("GAS ウェブアプリ URL", type="password")
     else:
-        st.success("✅ Googleシート連携 接続OK")
+        GEMINI_API_KEY = st.text_input("Gemini API キー", type="password")
 
-tab1, tab2 = st.tabs(["📸 レシート自動記録", "✍️ 1日の振り返り日記"])
+    if GAS_WEBAPP_URL:
+        st.success("✅ Googleシート連携 接続OK")
+    else:
+        GAS_WEBAPP_URL = st.text_input("GAS ウェブアプリ URL", type="password")
+
+    if APP_PASSWORD:
+        if st.button("🔒 画面をロックする", use_container_width=True):
+            st.session_state["authenticated"] = False
+            st.rerun()
+
+
+def post_to_gas(payload):
+    if not GAS_WEBAPP_URL:
+        st.error("GAS ウェブアプリ URL が設定されていないよ！")
+        return False
+    try:
+        res = requests.post(GAS_WEBAPP_URL, json=payload, timeout=15)
+        if res.status_code == 200:
+            return True
+        st.error(f"送信エラー ({res.status_code}): {res.text}")
+    except Exception as e:
+        st.error(f"通信エラー: {e}")
+    return False
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_from_gas(url):
+    if not url:
+        return None
+    try:
+        res = requests.get(url, timeout=15)
+        if res.status_code == 200:
+            return res.json()
+    except Exception:
+        pass
+    return None
+
+
+tab1, tab2, tab3, tab4 = st.tabs(
+    ["📸 レシート撮影", "⚡ ワンタップ記録", "✍️ 1日の振り返り", "📊 今月の集計"]
+)
 
 # ==========================================================
 # タブ1：レシート撮影・AI読み取り＆家計簿登録
@@ -67,24 +125,23 @@ with tab1:
             use_container_width=True,
         ):
             if not GEMINI_API_KEY:
-                st.error(
-                    "👈 左メニュー（またはSecrets）に Gemini API キーを入れてね！"
-                )
+                st.error("Gemini API キーを設定してね！")
             else:
-                with st.spinner("🤖 Geminiが品目と金額を読み取り中..."):
+                with st.spinner("🤖 Gemini 3.8 Flash が明細を読み取り中..."):
                     try:
                         client = genai.Client(api_key=GEMINI_API_KEY)
                         prompt = """
                         あなたは優秀な家計簿アシスタントです。
-                        添付されたレシート画像から情報を読み取り、以下のJSON形式のみを出力してください。Markdownのコードブロック(```jsonなど)は含めないでください。
+                        添付されたレシート画像から情報を読み取り、以下のJSON形式のみを出力してください。Markdownのコードブロックは含めないでください。
+                        値引きやクーポンがある場合は、該当品目から引くか「値引き」項目をマイナス金額で入れて合計がレシートの支払総額と一致するように調整してください。
 
                         {
                           "date": "YYYY/MM/DD（読み取れない場合は空文字）",
-                          "store": "店名（例：セブンイレブン、スーパーなど）",
+                          "store": "店名（例：セブンイレブン、まいばすけっと、居酒屋など）",
                           "payment": "支払方法（現金、PayPay、クレジットカード、交通系ICなど。不明なら空文字）",
                           "items": [
                             {
-                              "name": "品目名（割引や税込み調整があれば反映した実質額で）",
+                              "name": "品目名",
                               "category": "食費、日用品、交際費・飲み会、趣味・娯楽、交通費、美容・健康、その他のいずれか",
                               "price": 金額(整数),
                               "memo": "特記事項があれば（なければ空文字）"
@@ -105,7 +162,6 @@ with tab1:
                     except Exception as e:
                         st.error(f"読み取り中にエラーが起きたよ: {e}")
 
-    # 解析結果の確認・編集・送信フォーム
     if "receipt_data" in st.session_state:
         rdata = st.session_state["receipt_data"]
         st.divider()
@@ -122,9 +178,6 @@ with tab1:
         with col3:
             r_pay = st.text_input("支払方法", value=rdata.get("payment", ""))
 
-        st.caption(
-            "👇 表の中身は直接タップして文字や金額を直せるよ！行の追加・削除もOK！"
-        )
         edited_items = st.data_editor(
             rdata.get("items", []),
             num_rows="dynamic",
@@ -161,40 +214,118 @@ with tab1:
             type="primary",
             use_container_width=True,
         ):
-            if not GAS_WEBAPP_URL:
-                st.error("👈 GAS ウェブアプリ URL が設定されていないよ！")
-            else:
-                with st.spinner("スプレッドシートへ送信中..."):
-                    payload = {
-                        "type": "receipt",
-                        "date": r_date,
-                        "store": r_store,
-                        "payment": r_pay,
-                        "items": edited_items,
-                    }
-                    try:
-                        res = requests.post(
-                            GAS_WEBAPP_URL, json=payload, timeout=15
-                        )
-                        if res.status_code == 200:
-                            st.balloons()
-                            st.success(
-                                "✅ スプレッドシートの「家計簿明細」に保存したよ！！"
-                            )
-                            del st.session_state["receipt_data"]
-                        else:
-                            st.error(
-                                f"送信エラー ({res.status_code}): {res.text}"
-                            )
-                    except Exception as e:
-                        st.error(f"通信エラー: {e}")
+            with st.spinner("スプレッドシートへ送信中..."):
+                payload = {
+                    "type": "receipt",
+                    "date": r_date,
+                    "store": r_store,
+                    "payment": r_pay,
+                    "items": edited_items,
+                }
+                if post_to_gas(payload):
+                    st.balloons()
+                    st.success("✅ スプレッドシートに保存したよ！！")
+                    del st.session_state["receipt_data"]
+                    fetch_from_gas.clear()
 
 # ==========================================================
-# タブ2：1日の振り返り・日記記録
+# タブ2：レシートなし・ワンタップクイック記録
 # ==========================================================
 with tab2:
-    st.subheader("✍️ 今日の振り返りログ")
-    d_date = st.date_input("日付", value=today_jst)
+    st.subheader("⚡ レシートなし・ワンタップ記録")
+    st.caption("自販機やチャージ、よく買う定番アイテムを1タップで即記帳！")
+
+    presets = [
+        ("🥤 自販機・コンビニ飲料", "コンビニ/自販機", "食費", 160, "交通系IC"),
+        ("🚃 交通系ICチャージ", "駅券売機", "交通費", 3000, "現金"),
+        ("🍜 ランチ・ラーメン外食", "飲食店", "食費", 1000, "PayPay"),
+        ("🍻 飲み会・居酒屋", "居酒屋", "交際費・飲み会", 5000, "現金"),
+        ("💪 プロテイン・サプリ補充", "ネット通販", "美容・健康", 4000, "クレジットカード"),
+        ("🎨 同人誌・クリエイター支援", "BOOTH/FANBOX", "趣味・娯楽", 1000, "クレジットカード"),
+    ]
+
+    p_cols = st.columns(2)
+    for idx, (label, store, cat, price, pay) in enumerate(presets):
+        with p_cols[idx % 2]:
+            if st.button(
+                f"{label}\n({price:,}円)",
+                key=f"preset_{idx}",
+                use_container_width=True,
+            ):
+                payload = {
+                    "type": "receipt",
+                    "date": today_jst.strftime("%Y/%m/%d"),
+                    "store": store,
+                    "payment": pay,
+                    "items": [
+                        {
+                            "name": label.split(" ", 1)[1],
+                            "category": cat,
+                            "price": price,
+                            "memo": "ワンタップ登録",
+                        }
+                    ],
+                }
+                with st.spinner("記録中..."):
+                    if post_to_gas(payload):
+                        st.toast(f"✅ 「{label}」({price:,}円) を記録したよ！")
+                        fetch_from_gas.clear()
+
+    st.divider()
+    st.markdown("### ✍️ 自由入力（手打ちサクッと登録）")
+    with st.form("quick_manual_form", clear_on_submit=True):
+        q_date = st.date_input("日付", value=today_jst)
+        qc1, qc2 = st.columns(2)
+        with qc1:
+            q_store = st.text_input("店名・場所", placeholder="例：松屋、Amazon")
+            q_name = st.text_input("品目名", placeholder="例：牛めし並、単3電池")
+        with qc2:
+            q_cat = st.selectbox(
+                "カテゴリ",
+                [
+                    "食費",
+                    "日用品",
+                    "交際費・飲み会",
+                    "趣味・娯楽",
+                    "交通費",
+                    "美容・健康",
+                    "その他",
+                ],
+            )
+            q_price = st.number_input("金額（円）", min_value=1, value=500, step=10)
+        q_pay = st.selectbox(
+            "支払方法", ["PayPay", "交通系IC", "クレジットカード", "現金", "その他"]
+        )
+        if st.form_submit_button(
+            "📤 この内容で記録する", type="primary", use_container_width=True
+        ):
+            if not q_name.strip():
+                st.warning("品目名を入れてね！")
+            else:
+                payload = {
+                    "type": "receipt",
+                    "date": q_date.strftime("%Y/%m/%d"),
+                    "store": q_store or "手入力",
+                    "payment": q_pay,
+                    "items": [
+                        {
+                            "name": q_name,
+                            "category": q_cat,
+                            "price": int(q_price),
+                            "memo": "",
+                        }
+                    ],
+                }
+                if post_to_gas(payload):
+                    st.success(f"✅ 「{q_name}」({q_price:,}円) を保存したよ！")
+                    fetch_from_gas.clear()
+
+# ==========================================================
+# タブ3：1日の振り返り・ランニング＆体重記録
+# ==========================================================
+with tab3:
+    st.subheader("✍️ 今日の振り返り ＆ コンディション記録")
+    d_date = st.date_input("日付", value=today_jst, key="diary_date")
     d_mood = st.select_slider(
         "今日の気分・コンディション",
         options=[
@@ -206,35 +337,64 @@ with tab2:
         ],
         value="🙂 いい感じ",
     )
+
+    dc1, dc2 = st.columns(2)
+    with dc1:
+        d_dist = st.number_input(
+            "🏃‍♂️ ラン・ウォーキング距離 (km)",
+            min_value=0.0,
+            max_value=100.0,
+            value=0.0,
+            step=0.5,
+            format="%.1f",
+        )
+    with dc2:
+        d_weight = st.number_input(
+            "⚖️ 今日の体重 (kg) ※未計測は0",
+            min_value=0.0,
+            max_value=150.0,
+            value=0.0,
+            step=0.1,
+            format="%.1f",
+        )
+
     d_content = st.text_area(
-        "今日あったこと・食べたもの・走った距離・思ったことなど",
-        height=150,
-        placeholder="例：仕事帰りに新宿から中野まで7kmウォーキングした！プロテインもバッチリ飲んだ！",
+        "今日あったこと・食べたもの・思ったこと",
+        height=130,
+        placeholder="例：仕事帰りに新宿から中野まで7km歩いた！プロテインもバッチリ！",
     )
 
     if st.button(
-        "✨ AIの応援コメント付きで日記を保存！",
+        "✨ AIの応援コメント付きで保存！",
         type="primary",
         use_container_width=True,
     ):
-        if not d_content.strip():
-            st.warning("何か少しでも文章を書いてみてね！")
-        elif not GAS_WEBAPP_URL:
-            st.error("👈 GAS ウェブアプリ URL が設定されていないよ！")
+        if not d_content.strip() and d_dist == 0 and d_weight == 0:
+            st.warning("日記か距離・体重のどれかを入力してね！")
         else:
             ai_reply = ""
             if GEMINI_API_KEY:
                 with st.spinner("🤖 AIが今日の日記を読んでコメント作成中..."):
                     try:
                         client = genai.Client(api_key=GEMINI_API_KEY)
-                        c_prompt = f"ユーザー（ありんこ）の今日の振り返り日記です。気分：{d_mood}\n内容：{d_content}\nこれに対して、親しみやすいフランクな口調で、労いやポジティブな一言コメントを2〜3文（100文字以内）で返してください。"
+                        extra_info = []
+                        if d_dist > 0:
+                            extra_info.append(f"運動距離: {d_dist}km")
+                        if d_weight > 0:
+                            extra_info.append(f"体重: {d_weight}kg")
+                        c_prompt = (
+                            f"ユーザー（ありんこ・東京マラソン完走やダイエットも頑張っている）の今日の記録です。\n"
+                            f"気分：{d_mood} / {' / '.join(extra_info)}\n"
+                            f"内容：{d_content}\n"
+                            f"親しみやすいフランクな口調で、労いやポジティブな一言コメントを2文（100文字以内）で返してください。"
+                        )
                         c_res = client.models.generate_content(
                             model="gemini-3.8-flash",
                             contents=c_prompt,
                         )
                         ai_reply = c_res.text.strip()
                     except Exception:
-                        ai_reply = "今日もお疲れさま！"
+                        ai_reply = "今日もお疲れさま！ゆっくり休んでね！"
 
             with st.spinner("スプレッドシートへ記録中..."):
                 payload = {
@@ -243,18 +403,92 @@ with tab2:
                     "mood": d_mood,
                     "content": d_content,
                     "ai_comment": ai_reply,
+                    "distance": d_dist if d_dist > 0 else None,
+                    "weight": d_weight if d_weight > 0 else None,
                 }
-                try:
-                    res = requests.post(
-                        GAS_WEBAPP_URL, json=payload, timeout=15
-                    )
-                    if res.status_code == 200:
-                        st.success(
-                            "✅ スプレッドシートの「1日の振り返り」に保存したよ！"
-                        )
-                        if ai_reply:
-                            st.info(f"🤖 **AIからの一言：** {ai_reply}")
-                    else:
-                        st.error(f"送信エラー: {res.text}")
-                except Exception as e:
-                    st.error(f"通信エラー: {e}")
+                if post_to_gas(payload):
+                    st.success("✅ 「1日の振り返り」に保存したよ！")
+                    if ai_reply:
+                        st.info(f"🤖 **AIからの一言：** {ai_reply}")
+                    fetch_from_gas.clear()
+
+# ==========================================================
+# タブ4：今月の集計＆グラフ・過去ログ閲覧
+# ==========================================================
+with tab4:
+    st.subheader("📊 家計簿集計 ＆ 振り返りログ")
+    if st.button("🔄 最新データに更新", use_container_width=True):
+        fetch_from_gas.clear()
+        st.rerun()
+
+    gas_data = fetch_from_gas(GAS_WEBAPP_URL)
+    if not gas_data or gas_data.get("status") != "success":
+        st.info(
+            "💡 スプレッドシートのデータを読み込めなかったよ！GASに `doGet` を追加して「新バージョン」でデプロイしたか確認してね！"
+        )
+    else:
+        receipts = gas_data.get("receipts", [])
+        diaries = gas_data.get("diaries", [])
+
+        if receipts:
+            df = pd.DataFrame(receipts)
+            df["ym"] = df["date"].str.slice(0, 7)
+            ym_list = sorted(df["ym"].dropna().unique().tolist(), reverse=True)
+            current_ym = today_jst.strftime("%Y/%m")
+            default_idx = ym_list.index(current_ym) if current_ym in ym_list else 0
+
+            selected_ym = st.selectbox("📅 表示する年月", ym_list, index=default_idx)
+            month_df = df[df["ym"] == selected_ym]
+
+            total_spent = int(month_df["price"].sum())
+            remain = monthly_budget - total_spent
+
+            m1, m2 = st.columns(2)
+            with m1:
+                st.metric(f"💸 {selected_ym} の支出合計", f"{total_spent:,} 円")
+            with m2:
+                st.metric(
+                    "💰 今月の残り予算",
+                    f"{remain:,} 円",
+                    delta=f"予算 {monthly_budget:,}円",
+                )
+
+            ratio = min(1.0, max(0.0, total_spent / max(1, monthly_budget)))
+            st.progress(ratio, text=f"予算消化率：{int(ratio * 100)}%")
+
+            st.markdown("### 📈 カテゴリ別支出")
+            cat_summary = (
+                month_df.groupby("category")["price"]
+                .sum()
+                .sort_values(ascending=False)
+            )
+            st.bar_chart(cat_summary)
+
+            for cat_name, val in cat_summary.items():
+                st.write(f"・**{cat_name}**：{int(val):,} 円")
+
+            st.divider()
+            st.markdown("### 🧾 最近の明細一覧（最新20件）")
+            show_df = month_df[
+                ["date", "store", "name", "category", "price", "payment"]
+            ].iloc[::-1].head(20)
+            show_df.columns = ["日付", "店名", "品目", "カテゴリ", "金額", "支払"]
+            st.dataframe(show_df, use_container_width=True, hide_index=True)
+        else:
+            st.info("まだ家計簿データがないよ！レシートを登録してみよう！")
+
+        if diaries:
+            st.divider()
+            st.markdown("### 📖 最近の振り返りログ（最新7日分）")
+            for d in reversed(diaries[-7:]):
+                badges = [d.get("mood", "")]
+                if d.get("distance"):
+                    badges.append(f"🏃‍♂️ {d['distance']}km")
+                if d.get("weight"):
+                    badges.append(f"⚖️ {d['weight']}kg")
+                with st.container(border=True):
+                    st.markdown(f"**📅 {d['date']}** ｜ {' / '.join(badges)}")
+                    if d.get("content"):
+                        st.write(d["content"])
+                    if d.get("ai_comment"):
+                        st.caption(f"🤖 {d['ai_comment']}")
