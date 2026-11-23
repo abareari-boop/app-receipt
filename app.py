@@ -1,10 +1,11 @@
 from datetime import datetime, timedelta, timezone
+import io
 import json
 import os
 from google import genai
 from google.genai import types
 import pandas as pd
-from PIL import Image
+from PIL import Image, ImageOps
 import requests
 import streamlit as st
 
@@ -29,7 +30,7 @@ def get_secret(key, default=""):
 
 GEMINI_API_KEY = get_secret("gemini_api_key")
 GAS_WEBAPP_URL = get_secret("gas_webapp_url")
-APP_PASSWORD = get_secret("app_password")  # Secretsに設定すれば合言葉ロック有効！
+APP_PASSWORD = get_secret("app_password")
 
 # ==========================================================
 # 🔒 合言葉（パスワード）ロック機能
@@ -37,7 +38,6 @@ APP_PASSWORD = get_secret("app_password")  # Secretsに設定すれば合言葉�
 if APP_PASSWORD:
     if not st.session_state.get("authenticated", False):
         st.title("🔒 ありんこ専用ロック")
-        st.caption("合言葉を入力してロックを解除してね！")
         pw_input = st.text_input("合言葉（パスワード）", type="password")
         if st.button("🔓 ロック解除", type="primary", use_container_width=True):
             if pw_input == APP_PASSWORD:
@@ -75,6 +75,42 @@ with st.sidebar:
             st.rerun()
 
 
+# ==========================================================
+# ⚡ 爆速化ヘルパー：画像をAI解析用の軽量JPEGに自動圧縮
+# ==========================================================
+def compress_receipt_image(uploaded_file, max_width=1024):
+    img = Image.open(uploaded_file)
+    img = ImageOps.exif_transpose(img)  # スマホの縦横回転を自動補正
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    w, h = img.size
+    if w > max_width:
+        new_h = int(h * (max_width / w))
+        img = img.resize((max_width, new_h), Image.Resampling.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=80, optimize=True)
+    buf.seek(0)
+    return Image.open(buf)
+
+
+def analyze_receipt_with_gemini(image):
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    prompt = """
+    レシート画像から情報を抽出し、以下のJSON形式のみを出力してください。Markdown記号は不要です。
+    値引きやクーポンがある場合は該当品目から引くか「値引き」項目をマイナス金額で入れ、合計が支払総額と一致するよう調整してください。
+    {"date":"YYYY/MM/DD","store":"店名","payment":"支払方法","items":[{"name":"品目名","category":"食費|日用品|交際費・飲み会|趣味・娯楽|交通費|美容・健康|その他","price":0,"memo":""}]}
+    """
+    response = client.models.generate_content(
+        model="gemini-3.8-flash",
+        contents=[image, prompt],
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            thinking_config=types.ThinkingConfig(thinking_budget=0),  # 思考時間をゼロにして最速応答！
+        ),
+    )
+    return json.loads(response.text)
+
+
 def post_to_gas(payload):
     if not GAS_WEBAPP_URL:
         st.error("GAS ウェブアプリ URL が設定されていないよ！")
@@ -107,60 +143,59 @@ tab1, tab2, tab3, tab4 = st.tabs(
 )
 
 # ==========================================================
-# タブ1：レシート撮影・AI読み取り＆家計簿登録
+# タブ1：レシート撮影・爆速AI読み取り＆家計簿登録
 # ==========================================================
 with tab1:
-    st.subheader("レシートを撮ってAIにおまかせ！")
+    st.subheader("レシートを撮って爆速記録！")
     uploaded_file = st.file_uploader(
         "📷 カメラで撮影 または 画像を選択", type=["jpg", "jpeg", "png", "webp"]
     )
 
     if uploaded_file is not None:
-        image = Image.open(uploaded_file)
-        st.image(image, caption="アップロードされたレシート", use_container_width=True)
+        light_image = compress_receipt_image(uploaded_file)
+        st.image(light_image, width=280)
 
-        if st.button(
-            "✨ AIでレシートを読み取る！",
-            type="primary",
-            use_container_width=True,
-        ):
+        col_btn1, col_btn2 = st.columns(2)
+        with col_btn1:
+            auto_save_btn = st.button(
+                "⚡ 読み取って即シートへ保存！",
+                type="primary",
+                use_container_width=True,
+                help="確認画面を飛ばして、AI読み取りからスプレッドシート記帳まで一発で完了します！",
+            )
+        with col_btn2:
+            preview_btn = st.button(
+                "🔍 まず内容を確認・編集する",
+                use_container_width=True,
+            )
+
+        if auto_save_btn or preview_btn:
             if not GEMINI_API_KEY:
                 st.error("Gemini API キーを設定してね！")
             else:
-                with st.spinner("🤖 Gemini 3.8 Flash が明細を読み取り中..."):
+                with st.spinner("⚡ 超高速スキャン中..."):
                     try:
-                        client = genai.Client(api_key=GEMINI_API_KEY)
-                        prompt = """
-                        あなたは優秀な家計簿アシスタントです。
-                        添付されたレシート画像から情報を読み取り、以下のJSON形式のみを出力してください。Markdownのコードブロックは含めないでください。
-                        値引きやクーポンがある場合は、該当品目から引くか「値引き」項目をマイナス金額で入れて合計がレシートの支払総額と一致するように調整してください。
-
-                        {
-                          "date": "YYYY/MM/DD（読み取れない場合は空文字）",
-                          "store": "店名（例：セブンイレブン、まいばすけっと、居酒屋など）",
-                          "payment": "支払方法（現金、PayPay、クレジットカード、交通系ICなど。不明なら空文字）",
-                          "items": [
-                            {
-                              "name": "品目名",
-                              "category": "食費、日用品、交際費・飲み会、趣味・娯楽、交通費、美容・健康、その他のいずれか",
-                              "price": 金額(整数),
-                              "memo": "特記事項があれば（なければ空文字）"
+                        parsed = analyze_receipt_with_gemini(light_image)
+                        if auto_save_btn:
+                            payload = {
+                                "type": "receipt",
+                                "date": parsed.get("date") or today_jst.strftime("%Y/%m/%d"),
+                                "store": parsed.get("store", ""),
+                                "payment": parsed.get("payment", ""),
+                                "items": parsed.get("items", []),
                             }
-                          ]
-                        }
-                        """
-                        response = client.models.generate_content(
-                            model="gemini-3.8-flash",
-                            contents=[image, prompt],
-                            config=types.GenerateContentConfig(
-                                response_mime_type="application/json"
-                            ),
-                        )
-                        parsed = json.loads(response.text)
-                        st.session_state["receipt_data"] = parsed
-                        st.success("🎉 読み取り完了！内容を確認してね！")
+                            if post_to_gas(payload):
+                                total_p = sum(int(i.get("price", 0) or 0) for i in parsed.get("items", []))
+                                st.balloons()
+                                st.success(
+                                    f"🎉 一発記録完了！【{parsed.get('store', '店舗')}】合計 {total_p:,}円（{len(parsed.get('items', []))}品目）を保存したよ！"
+                                )
+                                fetch_from_gas.clear()
+                        else:
+                            st.session_state["receipt_data"] = parsed
+                            st.success("🎉 読み取り完了！下で修正できるよ！")
                     except Exception as e:
-                        st.error(f"読み取り中にエラーが起きたよ: {e}")
+                        st.error(f"読み取りエラー: {e}")
 
     if "receipt_data" in st.session_state:
         rdata = st.session_state["receipt_data"]
@@ -233,8 +268,6 @@ with tab1:
 # ==========================================================
 with tab2:
     st.subheader("⚡ レシートなし・ワンタップ記録")
-    st.caption("自販機やチャージ、よく買う定番アイテムを1タップで即記帳！")
-
     presets = [
         ("🥤 自販機・コンビニ飲料", "コンビニ/自販機", "食費", 160, "交通系IC"),
         ("🚃 交通系ICチャージ", "駅券売機", "交通費", 3000, "現金"),
@@ -374,7 +407,7 @@ with tab3:
         else:
             ai_reply = ""
             if GEMINI_API_KEY:
-                with st.spinner("🤖 AIが今日の日記を読んでコメント作成中..."):
+                with st.spinner("🤖 AIコメント作成中..."):
                     try:
                         client = genai.Client(api_key=GEMINI_API_KEY)
                         extra_info = []
@@ -391,6 +424,9 @@ with tab3:
                         c_res = client.models.generate_content(
                             model="gemini-3.8-flash",
                             contents=c_prompt,
+                            config=types.GenerateContentConfig(
+                                thinking_config=types.ThinkingConfig(thinking_budget=0)
+                            ),
                         )
                         ai_reply = c_res.text.strip()
                     except Exception:
