@@ -106,33 +106,35 @@ def compress_receipt_image(uploaded_file, max_width=1024):
 
 def call_gemini_with_fallback(contents, is_json=False):
     client = genai.Client(api_key=GEMINI_API_KEY)
-    if "自動リレー" in model_choice:
-        # 混雑しにくい軽量高速モデルを優先しつつ順番にリレー！
-        models_to_try = [
-            "gemini-3.8-flash-lite",
-            "gemini-2.5-flash-lite",
-            "gemini-3.8-flash",
-            "gemini-3.8-flash-lite",
-        ]
-    else:
-        models_to_try = [model_choice, "gemini-3.8-flash-lite", "gemini-2.5-flash-lite"]
+
+    # ありんこのAPIキーで実際に使えるモデル一覧をサーバーから直接取得！
+    available_models = []
+    try:
+        for m in client.models.list():
+            name = m.name.replace("models/", "")
+            # 画像やテキスト生成（generateContent）に対応しているflash系を優先収集
+            actions = getattr(m, "supported_actions", []) or []
+            if "generateContent" in actions and "flash" in name.lower():
+                available_models.append(name)
+    except Exception:
+        pass
+
+    # 一覧取得できたモデルを優先し、念のため既知のモデルも後ろに並べる
+    candidates = []
+    if "自動リレー" not in model_choice:
+        candidates.append(model_choice)
+    for m in available_models + ["gemini-3.8-flash", "gemini-3-flash-preview", "gemini-2.5-flash"]:
+        if m not in candidates:
+            candidates.append(m)
 
     cfg_kwargs = {}
     if is_json:
         cfg_kwargs["response_mime_type"] = "application/json"
 
     last_err = None
-    for idx, model_name in enumerate(models_to_try):
+    for idx, model_name in enumerate(candidates):
         try:
-            # 3.8系は思考時間を0にして最速化
-            if "3.8" in model_name:
-                cfg = types.GenerateContentConfig(
-                    **cfg_kwargs,
-                    thinking_config=types.ThinkingConfig(thinking_budget=0),
-                )
-            else:
-                cfg = types.GenerateContentConfig(**cfg_kwargs)
-
+            cfg = types.GenerateContentConfig(**cfg_kwargs)
             response = client.models.generate_content(
                 model=model_name,
                 contents=contents,
@@ -142,9 +144,9 @@ def call_gemini_with_fallback(contents, is_json=False):
         except Exception as e:
             last_err = e
             err_str = str(e)
-            # 503混雑・429制限・404非対応時は次のモデルへ自動切り替え
-            if any(code in err_str for code in ["503", "UNAVAILABLE", "429", "404", "NOT_FOUND"]):
-                time.sleep(1.5 * (idx + 1))
+            # 404（非対応）・503（混雑）・429（制限）なら自動で次の利用可能モデルへスキップ！
+            if any(code in err_str for code in ["404", "NOT_FOUND", "503", "UNAVAILABLE", "429"]):
+                time.sleep(1.0)
                 continue
             raise e
     raise last_err
