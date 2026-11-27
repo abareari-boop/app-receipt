@@ -2,6 +2,7 @@ from datetime import datetime, timedelta, timezone
 import io
 import json
 import os
+import time
 from google import genai
 from google.genai import types
 import pandas as pd
@@ -58,6 +59,16 @@ with st.sidebar:
         value=100000,
         step=5000,
     )
+    model_choice = st.selectbox(
+        "🤖 AIモデル設定",
+        [
+            "🚀 自動リレー（混雑回避・おすすめ）",
+            "gemini-3.8-flash-lite",
+            "gemini-3.8-flash",
+            "gemini-2.5-flash-lite",
+        ],
+        index=0,
+    )
     st.divider()
     if GEMINI_API_KEY:
         st.success("✅ Gemini API 接続OK")
@@ -76,11 +87,11 @@ with st.sidebar:
 
 
 # ==========================================================
-# ⚡ 爆速化ヘルパー：画像をAI解析用の軽量JPEGに自動圧縮
+# ⚡ 爆速化＆503混雑回避ヘルパー
 # ==========================================================
 def compress_receipt_image(uploaded_file, max_width=1024):
     img = Image.open(uploaded_file)
-    img = ImageOps.exif_transpose(img)  # スマホの縦横回転を自動補正
+    img = ImageOps.exif_transpose(img)
     if img.mode != "RGB":
         img = img.convert("RGB")
     w, h = img.size
@@ -93,22 +104,60 @@ def compress_receipt_image(uploaded_file, max_width=1024):
     return Image.open(buf)
 
 
-def analyze_receipt_with_gemini(image):
+def call_gemini_with_fallback(contents, is_json=False):
     client = genai.Client(api_key=GEMINI_API_KEY)
+    if "自動リレー" in model_choice:
+        # 混雑しにくい軽量高速モデルを優先しつつ順番にリレー！
+        models_to_try = [
+            "gemini-3.8-flash-lite",
+            "gemini-2.5-flash-lite",
+            "gemini-3.8-flash",
+            "gemini-3.8-flash-lite",
+        ]
+    else:
+        models_to_try = [model_choice, "gemini-3.8-flash-lite", "gemini-2.5-flash-lite"]
+
+    cfg_kwargs = {}
+    if is_json:
+        cfg_kwargs["response_mime_type"] = "application/json"
+
+    last_err = None
+    for idx, model_name in enumerate(models_to_try):
+        try:
+            # 3.8系は思考時間を0にして最速化
+            if "3.8" in model_name:
+                cfg = types.GenerateContentConfig(
+                    **cfg_kwargs,
+                    thinking_config=types.ThinkingConfig(thinking_budget=0),
+                )
+            else:
+                cfg = types.GenerateContentConfig(**cfg_kwargs)
+
+            response = client.models.generate_content(
+                model=model_name,
+                contents=contents,
+                config=cfg,
+            )
+            return response.text, model_name
+        except Exception as e:
+            last_err = e
+            err_str = str(e)
+            # 503混雑・429制限・404非対応時は次のモデルへ自動切り替え
+            if any(code in err_str for code in ["503", "UNAVAILABLE", "429", "404", "NOT_FOUND"]):
+                time.sleep(1.5 * (idx + 1))
+                continue
+            raise e
+    raise last_err
+
+
+def analyze_receipt_with_gemini(image):
     prompt = """
     レシート画像から情報を抽出し、以下のJSON形式のみを出力してください。Markdown記号は不要です。
     値引きやクーポンがある場合は該当品目から引くか「値引き」項目をマイナス金額で入れ、合計が支払総額と一致するよう調整してください。
     {"date":"YYYY/MM/DD","store":"店名","payment":"支払方法","items":[{"name":"品目名","category":"食費|日用品|交際費・飲み会|趣味・娯楽|交通費|美容・健康|その他","price":0,"memo":""}]}
     """
-    response = client.models.generate_content(
-        model="gemini-3.8-flash",
-        contents=[image, prompt],
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            thinking_config=types.ThinkingConfig(thinking_budget=0),  # 思考時間をゼロにして最速応答！
-        ),
-    )
-    return json.loads(response.text)
+    raw_text, used_model = call_gemini_with_fallback([image, prompt], is_json=True)
+    return json.loads(raw_text), used_model
 
 
 def post_to_gas(payload):
@@ -175,7 +224,7 @@ with tab1:
             else:
                 with st.spinner("⚡ 超高速スキャン中..."):
                     try:
-                        parsed = analyze_receipt_with_gemini(light_image)
+                        parsed, used_model = analyze_receipt_with_gemini(light_image)
                         if auto_save_btn:
                             payload = {
                                 "type": "receipt",
@@ -188,12 +237,12 @@ with tab1:
                                 total_p = sum(int(i.get("price", 0) or 0) for i in parsed.get("items", []))
                                 st.balloons()
                                 st.success(
-                                    f"🎉 一発記録完了！【{parsed.get('store', '店舗')}】合計 {total_p:,}円（{len(parsed.get('items', []))}品目）を保存したよ！"
+                                    f"🎉 一発記録完了！【{parsed.get('store', '店舗')}】合計 {total_p:,}円（{len(parsed.get('items', []))}品目）を保存したよ！（使用AI: {used_model}）"
                                 )
                                 fetch_from_gas.clear()
                         else:
                             st.session_state["receipt_data"] = parsed
-                            st.success("🎉 読み取り完了！下で修正できるよ！")
+                            st.success(f"🎉 読み取り完了！（使用AI: {used_model}）下で修正できるよ！")
                     except Exception as e:
                         st.error(f"読み取りエラー: {e}")
 
@@ -409,7 +458,6 @@ with tab3:
             if GEMINI_API_KEY:
                 with st.spinner("🤖 AIコメント作成中..."):
                     try:
-                        client = genai.Client(api_key=GEMINI_API_KEY)
                         extra_info = []
                         if d_dist > 0:
                             extra_info.append(f"運動距離: {d_dist}km")
@@ -421,14 +469,8 @@ with tab3:
                             f"内容：{d_content}\n"
                             f"親しみやすいフランクな口調で、労いやポジティブな一言コメントを2文（100文字以内）で返してください。"
                         )
-                        c_res = client.models.generate_content(
-                            model="gemini-3.8-flash",
-                            contents=c_prompt,
-                            config=types.GenerateContentConfig(
-                                thinking_config=types.ThinkingConfig(thinking_budget=0)
-                            ),
-                        )
-                        ai_reply = c_res.text.strip()
+                        ai_reply, _ = call_gemini_with_fallback(c_prompt, is_json=False)
+                        ai_reply = ai_reply.strip()
                     except Exception:
                         ai_reply = "今日もお疲れさま！ゆっくり休んでね！"
 
