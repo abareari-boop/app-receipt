@@ -19,6 +19,52 @@ st.set_page_config(
 JST = timezone(timedelta(hours=9))
 today_jst = datetime.now(JST).date()
 
+PAYMENT_OPTIONS = [
+    "楽天Edy",
+    "PayPay",
+    "交通系IC",
+    "クレジットカード",
+    "現金",
+    "銀行振込・口座",
+    "その他",
+]
+
+EXPENSE_CATEGORIES = [
+    "食費",
+    "日用品",
+    "交際費・飲み会",
+    "趣味・娯楽",
+    "交通費",
+    "美容・健康",
+    "その他",
+]
+
+
+def normalize_date_str(val):
+    if not val:
+        return today_jst.strftime("%Y/%m/%d")
+    return str(val).strip().replace("-", "/")
+
+
+def normalize_payment_str(val):
+    if not val:
+        return "その他"
+    s = str(val).strip()
+    low = s.lower()
+    if "edy" in low or "エディ" in s:
+        return "楽天Edy"
+    if "paypay" in low or "ペイペイ" in s:
+        return "PayPay"
+    if any(k in low for k in ["suica", "pasmo", "icoca", "ic", "交通"]):
+        return "交通系IC"
+    if any(k in low for k in ["credit", "visa", "master", "jcb", "amex", "クレジット", "カード"]):
+        return "クレジットカード"
+    if "現金" in s or "cash" in low:
+        return "現金"
+    if "振込" in s or "口座" in s:
+        return "銀行振込・口座"
+    return s if s in PAYMENT_OPTIONS else "その他"
+
 
 def get_secret(key, default=""):
     try:
@@ -51,21 +97,29 @@ if APP_PASSWORD:
 st.title("🧾 レシート家計簿 ＆ 振り返り")
 
 with st.sidebar:
-    st.header("⚙️ 設定・目標予算")
+    st.header("⚙️ 設定・目標管理")
     monthly_budget = st.number_input(
-        "💰 今月の目標予算（円）",
+        "💰 今月の支出予算（円）",
         min_value=10000,
         max_value=1000000,
         value=100000,
         step=5000,
     )
+    target_weight = st.number_input(
+        "⚖️ 目標体重（kg）",
+        min_value=40.0,
+        max_value=120.0,
+        value=63.0,
+        step=0.5,
+        format="%.1f",
+    )
     model_choice = st.selectbox(
         "🤖 AIモデル設定",
         [
-            "🚀 自動リレー（混雑回避・おすすめ）",
-            "gemini-3.8-flash-lite",
+            "🚀 自動検出リレー（おすすめ）",
+            "gemini-3.1-flash-lite",
             "gemini-3.8-flash",
-            "gemini-2.5-flash-lite",
+            "gemini-2.5-flash",
         ],
         index=0,
     )
@@ -87,7 +141,7 @@ with st.sidebar:
 
 
 # ==========================================================
-# ⚡ 爆速化＆503混雑回避ヘルパー
+# ⚡ 画像軽量化＆AI自動検出リレー
 # ==========================================================
 def compress_receipt_image(uploaded_file, max_width=1024):
     img = Image.open(uploaded_file)
@@ -106,24 +160,20 @@ def compress_receipt_image(uploaded_file, max_width=1024):
 
 def call_gemini_with_fallback(contents, is_json=False):
     client = genai.Client(api_key=GEMINI_API_KEY)
-
-    # ありんこのAPIキーで実際に使えるモデル一覧をサーバーから直接取得！
     available_models = []
     try:
         for m in client.models.list():
             name = m.name.replace("models/", "")
-            # 画像やテキスト生成（generateContent）に対応しているflash系を優先収集
             actions = getattr(m, "supported_actions", []) or []
             if "generateContent" in actions and "flash" in name.lower():
                 available_models.append(name)
     except Exception:
         pass
 
-    # 一覧取得できたモデルを優先し、念のため既知のモデルも後ろに並べる
     candidates = []
-    if "自動リレー" not in model_choice:
+    if "自動検出" not in model_choice:
         candidates.append(model_choice)
-    for m in available_models + ["gemini-3.8-flash", "gemini-3-flash-preview", "gemini-2.5-flash"]:
+    for m in available_models + ["gemini-3.1-flash-lite", "gemini-3.8-flash", "gemini-2.5-flash"]:
         if m not in candidates:
             candidates.append(m)
 
@@ -132,7 +182,7 @@ def call_gemini_with_fallback(contents, is_json=False):
         cfg_kwargs["response_mime_type"] = "application/json"
 
     last_err = None
-    for idx, model_name in enumerate(candidates):
+    for model_name in candidates:
         try:
             cfg = types.GenerateContentConfig(**cfg_kwargs)
             response = client.models.generate_content(
@@ -144,7 +194,6 @@ def call_gemini_with_fallback(contents, is_json=False):
         except Exception as e:
             last_err = e
             err_str = str(e)
-            # 404（非対応）・503（混雑）・429（制限）なら自動で次の利用可能モデルへスキップ！
             if any(code in err_str for code in ["404", "NOT_FOUND", "503", "UNAVAILABLE", "429"]):
                 time.sleep(1.0)
                 continue
@@ -155,11 +204,16 @@ def call_gemini_with_fallback(contents, is_json=False):
 def analyze_receipt_with_gemini(image):
     prompt = """
     レシート画像から情報を抽出し、以下のJSON形式のみを出力してください。Markdown記号は不要です。
-    値引きやクーポンがある場合は該当品目から引くか「値引き」項目をマイナス金額で入れ、合計が支払総額と一致するよう調整してください。
-    {"date":"YYYY/MM/DD","store":"店名","payment":"支払方法","items":[{"name":"品目名","category":"食費|日用品|交際費・飲み会|趣味・娯楽|交通費|美容・健康|その他","price":0,"memo":""}]}
+    - 日付は必ず YYYY/MM/DD 形式にしてください。
+    - payment（支払方法）は必ず「楽天Edy」「PayPay」「交通系IC」「クレジットカード」「現金」「その他」のいずれかに統一してください（例：EdyやR Edyは「楽天Edy」、SuicaやPASMOは「交通系IC」）。
+    - 値引きやクーポンがある場合は該当品目から引くか「値引き」項目をマイナス金額で入れ、合計が支払総額と一致するよう調整してください。
+    {"date":"YYYY/MM/DD","store":"店名","payment":"楽天Edy|PayPay|交通系IC|クレジットカード|現金|その他","items":[{"name":"品目名","category":"食費|日用品|交際費・飲み会|趣味・娯楽|交通費|美容・健康|その他","price":0,"memo":""}]}
     """
     raw_text, used_model = call_gemini_with_fallback([image, prompt], is_json=True)
-    return json.loads(raw_text), used_model
+    parsed = json.loads(raw_text)
+    parsed["date"] = normalize_date_str(parsed.get("date"))
+    parsed["payment"] = normalize_payment_str(parsed.get("payment"))
+    return parsed, used_model
 
 
 def post_to_gas(payload):
@@ -190,11 +244,11 @@ def fetch_from_gas(url):
 
 
 tab1, tab2, tab3, tab4 = st.tabs(
-    ["📸 レシート撮影", "⚡ ワンタップ記録", "✍️ 1日の振り返り", "📊 今月の集計"]
+    ["📸 レシート撮影", "💰 収入・手入力", "✍️ 1日の振り返り", "📊 収支＆体重グラフ"]
 )
 
 # ==========================================================
-# タブ1：レシート撮影・爆速AI読み取り＆家計簿登録
+# タブ1：レシート撮影・爆速AI読み取り＆割り勘対応登録
 # ==========================================================
 with tab1:
     st.subheader("レシートを撮って爆速記録！")
@@ -204,7 +258,7 @@ with tab1:
 
     if uploaded_file is not None:
         light_image = compress_receipt_image(uploaded_file)
-        st.image(light_image, width=280)
+        st.image(light_image, width=260)
 
         col_btn1, col_btn2 = st.columns(2)
         with col_btn1:
@@ -212,11 +266,11 @@ with tab1:
                 "⚡ 読み取って即シートへ保存！",
                 type="primary",
                 use_container_width=True,
-                help="確認画面を飛ばして、AI読み取りからスプレッドシート記帳まで一発で完了します！",
+                help="自分の買い物レシートはこれで1タップ完結！",
             )
         with col_btn2:
             preview_btn = st.button(
-                "🔍 まず内容を確認・編集する",
+                "🔍 確認・編集（割り勘もこちら）",
                 use_container_width=True,
             )
 
@@ -224,45 +278,55 @@ with tab1:
             if not GEMINI_API_KEY:
                 st.error("Gemini API キーを設定してね！")
             else:
-                with st.spinner("⚡ 超高速スキャン中..."):
+                with st.spinner("⚡ スキャン中..."):
                     try:
                         parsed, used_model = analyze_receipt_with_gemini(light_image)
                         if auto_save_btn:
                             payload = {
                                 "type": "receipt",
-                                "date": parsed.get("date") or today_jst.strftime("%Y/%m/%d"),
+                                "date": normalize_date_str(parsed.get("date")),
                                 "store": parsed.get("store", ""),
-                                "payment": parsed.get("payment", ""),
+                                "payment": normalize_payment_str(parsed.get("payment")),
                                 "items": parsed.get("items", []),
                             }
                             if post_to_gas(payload):
                                 total_p = sum(int(i.get("price", 0) or 0) for i in parsed.get("items", []))
                                 st.balloons()
                                 st.success(
-                                    f"🎉 一発記録完了！【{parsed.get('store', '店舗')}】合計 {total_p:,}円（{len(parsed.get('items', []))}品目）を保存したよ！（使用AI: {used_model}）"
+                                    f"🎉 一発記録完了！【{parsed.get('store', '店舗')}】合計 {total_p:,}円（{payload['payment']}）を保存したよ！"
                                 )
                                 fetch_from_gas.clear()
                         else:
                             st.session_state["receipt_data"] = parsed
-                            st.success(f"🎉 読み取り完了！（使用AI: {used_model}）下で修正できるよ！")
+                            st.success(f"🎉 読み取り完了！（AI: {used_model}）")
                     except Exception as e:
                         st.error(f"読み取りエラー: {e}")
 
     if "receipt_data" in st.session_state:
         rdata = st.session_state["receipt_data"]
         st.divider()
-        st.markdown("### 📝 読み取り結果の確認・修正")
+        st.markdown("### 📝 読み取り結果の確認・割り勘調整")
 
         col1, col2, col3 = st.columns(3)
         with col1:
             r_date = st.text_input(
                 "購入日",
-                value=rdata.get("date") or today_jst.strftime("%Y/%m/%d"),
+                value=normalize_date_str(rdata.get("date")),
             )
         with col2:
             r_store = st.text_input("店名", value=rdata.get("store", ""))
         with col3:
-            r_pay = st.text_input("支払方法", value=rdata.get("payment", ""))
+            norm_pay = normalize_payment_str(rdata.get("payment"))
+            pay_idx = PAYMENT_OPTIONS.index(norm_pay) if norm_pay in PAYMENT_OPTIONS else 0
+            r_pay = st.selectbox("支払方法", PAYMENT_OPTIONS, index=pay_idx)
+
+        split_count = st.number_input(
+            "👥 割り勘人数（1ならそのまま、2なら半額、あとで回収するなら1のまま登録）",
+            min_value=1,
+            max_value=20,
+            value=1,
+            step=1,
+        )
 
         edited_items = st.data_editor(
             rdata.get("items", []),
@@ -272,15 +336,7 @@ with tab1:
                 "name": st.column_config.TextColumn("品目名", required=True),
                 "category": st.column_config.SelectboxColumn(
                     "カテゴリ",
-                    options=[
-                        "食費",
-                        "日用品",
-                        "交際費・飲み会",
-                        "趣味・娯楽",
-                        "交通費",
-                        "美容・健康",
-                        "その他",
-                    ],
+                    options=EXPENSE_CATEGORIES,
                     required=True,
                 ),
                 "price": st.column_config.NumberColumn(
@@ -290,23 +346,45 @@ with tab1:
             },
         )
 
-        total_amount = sum(
-            int(item.get("price", 0) or 0) for item in edited_items
-        )
-        st.metric("💰 合計金額", f"{total_amount:,} 円")
+        raw_total = sum(int(item.get("price", 0) or 0) for item in edited_items)
+        my_share = round(raw_total / split_count)
+
+        if split_count > 1:
+            st.metric(
+                f"💰 自分の負担額（{split_count}人で割り勘）",
+                f"{my_share:,} 円",
+                delta=f"レシート総額 {raw_total:,}円",
+            )
+        else:
+            st.metric("💰 合計金額", f"{raw_total:,} 円")
 
         if st.button(
             "📤 Googleスプレッドシートに記録する！",
             type="primary",
             use_container_width=True,
         ):
+            items_to_save = []
+            for item in edited_items:
+                adj_price = round((int(item.get("price", 0) or 0)) / split_count)
+                memo_txt = item.get("memo", "")
+                if split_count > 1:
+                    memo_txt = f"{memo_txt} ({split_count}人割り勘)".strip()
+                items_to_save.append(
+                    {
+                        "name": item.get("name", ""),
+                        "category": item.get("category", "その他"),
+                        "price": adj_price,
+                        "memo": memo_txt,
+                    }
+                )
+
             with st.spinner("スプレッドシートへ送信中..."):
                 payload = {
                     "type": "receipt",
-                    "date": r_date,
+                    "date": normalize_date_str(r_date),
                     "store": r_store,
-                    "payment": r_pay,
-                    "items": edited_items,
+                    "payment": normalize_payment_str(r_pay),
+                    "items": items_to_save,
                 }
                 if post_to_gas(payload):
                     st.balloons()
@@ -315,12 +393,65 @@ with tab1:
                     fetch_from_gas.clear()
 
 # ==========================================================
-# タブ2：レシートなし・ワンタップクイック記録
+# タブ2：収入・割り勘戻り ＆ ワンタップ支出記録
 # ==========================================================
 with tab2:
-    st.subheader("⚡ レシートなし・ワンタップ記録")
+    st.subheader("💰 収入・割り勘の戻りを記録する")
+    st.caption("お給料・臨時収入や、立て替えた飲み会代の割り勘回収分はここから記録できるよ！")
+
+    with st.form("income_refund_form", clear_on_submit=True):
+        inc_date = st.date_input("日付", value=today_jst, key="inc_date")
+        ic1, ic2 = st.columns(2)
+        with ic1:
+            inc_type = st.selectbox(
+                "種別",
+                [
+                    "🤝 割り勘の戻り（立て替え回収）",
+                    "💴 給与・ボーナス",
+                    "🎁 臨時収入・ポイント還元",
+                ],
+            )
+            inc_title = st.text_input(
+                "内容・相手メモ",
+                placeholder="例：はなの舞の割り勘回収、〇〇さんからPayPay送金",
+            )
+        with ic2:
+            inc_amount = st.number_input(
+                "金額（円）", min_value=1, value=3000, step=100, key="inc_amount"
+            )
+            inc_method = st.selectbox(
+                "受け取り方法", PAYMENT_OPTIONS, index=1, key="inc_method"
+            )
+
+        if st.form_submit_button(
+            "✨ 収入・戻りを記録する", type="primary", use_container_width=True
+        ):
+            is_refund = "割り勘の戻り" in inc_type
+            cat_label = "割り勘戻し" if is_refund else "収入"
+            # 割り勘戻しは支出から差し引くためマイナス金額、純粋な収入はプラス金額で「収入」カテゴリへ保存
+            save_price = -int(inc_amount) if is_refund else int(inc_amount)
+            payload = {
+                "type": "receipt",
+                "date": inc_date.strftime("%Y/%m/%d"),
+                "store": inc_type.split(" ", 1)[1],
+                "payment": inc_method,
+                "items": [
+                    {
+                        "name": inc_title.strip() or inc_type.split(" ", 1)[1],
+                        "category": cat_label,
+                        "price": save_price,
+                        "memo": "立て替え回収" if is_refund else "収入記録",
+                    }
+                ],
+            }
+            if post_to_gas(payload):
+                st.success(f"✅ 「{cat_label}」として {inc_amount:,}円 を記録したよ！")
+                fetch_from_gas.clear()
+
+    st.divider()
+    st.subheader("⚡ レシートなし・ワンタップ支出記録")
     presets = [
-        ("🥤 自販機・コンビニ飲料", "コンビニ/自販機", "食費", 160, "交通系IC"),
+        ("🥤 自販機・コンビニ飲料", "コンビニ/自販機", "食費", 160, "楽天Edy"),
         ("🚃 交通系ICチャージ", "駅券売機", "交通費", 3000, "現金"),
         ("🍜 ランチ・ラーメン外食", "飲食店", "食費", 1000, "PayPay"),
         ("🍻 飲み会・居酒屋", "居酒屋", "交際費・飲み会", 5000, "現金"),
@@ -356,7 +487,7 @@ with tab2:
                         fetch_from_gas.clear()
 
     st.divider()
-    st.markdown("### ✍️ 自由入力（手打ちサクッと登録）")
+    st.markdown("### ✍️ 自由入力（支出の手打ち登録）")
     with st.form("quick_manual_form", clear_on_submit=True):
         q_date = st.date_input("日付", value=today_jst)
         qc1, qc2 = st.columns(2)
@@ -364,24 +495,11 @@ with tab2:
             q_store = st.text_input("店名・場所", placeholder="例：松屋、Amazon")
             q_name = st.text_input("品目名", placeholder="例：牛めし並、単3電池")
         with qc2:
-            q_cat = st.selectbox(
-                "カテゴリ",
-                [
-                    "食費",
-                    "日用品",
-                    "交際費・飲み会",
-                    "趣味・娯楽",
-                    "交通費",
-                    "美容・健康",
-                    "その他",
-                ],
-            )
+            q_cat = st.selectbox("カテゴリ", EXPENSE_CATEGORIES)
             q_price = st.number_input("金額（円）", min_value=1, value=500, step=10)
-        q_pay = st.selectbox(
-            "支払方法", ["PayPay", "交通系IC", "クレジットカード", "現金", "その他"]
-        )
+        q_pay = st.selectbox("支払方法", PAYMENT_OPTIONS)
         if st.form_submit_button(
-            "📤 この内容で記録する", type="primary", use_container_width=True
+            "📤 この支出を記録する", use_container_width=True
         ):
             if not q_name.strip():
                 st.warning("品目名を入れてね！")
@@ -493,10 +611,10 @@ with tab3:
                     fetch_from_gas.clear()
 
 # ==========================================================
-# タブ4：今月の集計＆グラフ・過去ログ閲覧
+# タブ4：今月の収支集計＆支払方法別＆体重グラフ
 # ==========================================================
 with tab4:
-    st.subheader("📊 家計簿集計 ＆ 振り返りログ")
+    st.subheader("📊 家計簿収支 ＆ コンディション推移")
     if st.button("🔄 最新データに更新", use_container_width=True):
         fetch_from_gas.clear()
         st.rerun()
@@ -504,7 +622,7 @@ with tab4:
     gas_data = fetch_from_gas(GAS_WEBAPP_URL)
     if not gas_data or gas_data.get("status") != "success":
         st.info(
-            "💡 スプレッドシートのデータを読み込めなかったよ！GASに `doGet` を追加して「新バージョン」でデプロイしたか確認してね！"
+            "💡 スプレッドシートのデータを読み込めなかったよ！GASのウェブアプリURLを確認してね！"
         )
     else:
         receipts = gas_data.get("receipts", [])
@@ -512,7 +630,10 @@ with tab4:
 
         if receipts:
             df = pd.DataFrame(receipts)
-            df["ym"] = df["date"].str.slice(0, 7)
+            df["date_norm"] = df["date"].astype(str).str.replace("-", "/")
+            df["pay_norm"] = df["payment"].apply(normalize_payment_str)
+            df["ym"] = df["date_norm"].str.slice(0, 7)
+
             ym_list = sorted(df["ym"].dropna().unique().tolist(), reverse=True)
             current_ym = today_jst.strftime("%Y/%m")
             default_idx = ym_list.index(current_ym) if current_ym in ym_list else 0
@@ -520,45 +641,84 @@ with tab4:
             selected_ym = st.selectbox("📅 表示する年月", ym_list, index=default_idx)
             month_df = df[df["ym"] == selected_ym]
 
-            total_spent = int(month_df["price"].sum())
-            remain = monthly_budget - total_spent
+            # 収入と実質支出（割り勘戻しを差し引いた額）を分けて計算
+            income_df = month_df[month_df["category"] == "収入"]
+            expense_df = month_df[month_df["category"] != "収入"]
 
-            m1, m2 = st.columns(2)
+            total_income = int(income_df["price"].sum())
+            net_expense = int(expense_df["price"].sum())
+            remain_budget = monthly_budget - net_expense
+
+            m1, m2, m3 = st.columns(3)
             with m1:
-                st.metric(f"💸 {selected_ym} の支出合計", f"{total_spent:,} 円")
+                st.metric("💴 収入合計", f"{total_income:,} 円")
             with m2:
-                st.metric(
-                    "💰 今月の残り予算",
-                    f"{remain:,} 円",
-                    delta=f"予算 {monthly_budget:,}円",
-                )
+                st.metric("💸 実質支出", f"{net_expense:,} 円")
+            with m3:
+                if total_income > 0:
+                    balance = total_income - net_expense
+                    st.metric("📈 収支バランス", f"{balance:+,} 円")
+                else:
+                    st.metric("💰 残り予算", f"{remain_budget:,} 円")
 
-            ratio = min(1.0, max(0.0, total_spent / max(1, monthly_budget)))
-            st.progress(ratio, text=f"予算消化率：{int(ratio * 100)}%")
+            ratio = min(1.0, max(0.0, net_expense / max(1, monthly_budget)))
+            st.progress(ratio, text=f"支出予算（{monthly_budget:,}円）の消化率：{int(ratio * 100)}%")
 
-            st.markdown("### 📈 カテゴリ別支出")
+            st.markdown("### 📈 カテゴリ別支出（割り勘戻し反映後）")
             cat_summary = (
-                month_df.groupby("category")["price"]
+                expense_df.groupby("category")["price"]
                 .sum()
                 .sort_values(ascending=False)
             )
             st.bar_chart(cat_summary)
-
             for cat_name, val in cat_summary.items():
                 st.write(f"・**{cat_name}**：{int(val):,} 円")
+
+            st.markdown("### 💳 支払方法別の利用合計（名寄せ統一済み）")
+            pay_summary = (
+                expense_df[expense_df["price"] > 0]
+                .groupby("pay_norm")["price"]
+                .sum()
+                .sort_values(ascending=False)
+            )
+            for p_name, p_val in pay_summary.items():
+                st.write(f"・**{p_name}**：{int(p_val):,} 円")
 
             st.divider()
             st.markdown("### 🧾 最近の明細一覧（最新20件）")
             show_df = month_df[
-                ["date", "store", "name", "category", "price", "payment"]
+                ["date_norm", "store", "name", "category", "price", "pay_norm"]
             ].iloc[::-1].head(20)
-            show_df.columns = ["日付", "店名", "品目", "カテゴリ", "金額", "支払"]
+            show_df.columns = ["日付", "店名", "品目", "カテゴリ", "金額", "支払方法"]
             st.dataframe(show_df, use_container_width=True, hide_index=True)
         else:
             st.info("まだ家計簿データがないよ！レシートを登録してみよう！")
 
         if diaries:
             st.divider()
+            st.markdown("### 🏃‍♂️ 体重 ＆ 運動距離の推移")
+            ddf = pd.DataFrame(diaries)
+            ddf["date_norm"] = ddf["date"].astype(str).str.replace("-", "/")
+
+            w_df = ddf[ddf["weight"].notna() & (ddf["weight"] > 0)].copy()
+            if not w_df.empty:
+                latest_w = float(w_df.iloc[-1]["weight"])
+                diff_w = round(latest_w - target_weight, 1)
+                st.metric(
+                    "⚖️ 最新体重（目標まであと少し！）",
+                    f"{latest_w:.1f} kg",
+                    delta=f"目標 {target_weight:.1f}kg まで {diff_w:+.1f}kg",
+                    delta_color="inverse",
+                )
+                w_chart = w_df.set_index("date_norm")["weight"]
+                st.line_chart(w_chart)
+
+            dist_df = ddf[ddf["distance"].notna() & (ddf["distance"] > 0)].copy()
+            if not dist_df.empty:
+                total_km = float(dist_df["distance"].sum())
+                st.metric("🏃‍♂️ 累計ラン・ウォーキング距離", f"{total_km:.1f} km")
+                st.bar_chart(dist_df.set_index("date_norm")["distance"])
+
             st.markdown("### 📖 最近の振り返りログ（最新7日分）")
             for d in reversed(diaries[-7:]):
                 badges = [d.get("mood", "")]
@@ -567,7 +727,7 @@ with tab4:
                 if d.get("weight"):
                     badges.append(f"⚖️ {d['weight']}kg")
                 with st.container(border=True):
-                    st.markdown(f"**📅 {d['date']}** ｜ {' / '.join(badges)}")
+                    st.markdown(f"**📅 {normalize_date_str(d.get('date'))}** ｜ {' / '.join(badges)}")
                     if d.get("content"):
                         st.write(d["content"])
                     if d.get("ai_comment"):
